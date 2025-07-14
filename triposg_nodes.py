@@ -17,7 +17,7 @@ from .FlashVDM.point_processing import process_grid_points, reshape_grid_logits,
 
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
-
+model_dir = folder_paths.models_dir
 # Simple logger for TripoSG operations
 class Logger:
     def info(self, message):
@@ -44,7 +44,7 @@ class TripoSGModelLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_path": ("STRING", {"default": "", "tooltip": "Path to the TripoSG model either as a local path or 'pretrained' to download from HuggingFace"}),
+                
             },
             "optional": {
                 "attention_mode": (["sdpa", "sageattn"], {"default": "sdpa"}),
@@ -58,12 +58,12 @@ class TripoSGModelLoader:
     CATEGORY = "TripoSG"
     DESCRIPTION = "Loads a TripoSG model for 3D mesh generation from a single image"
 
-    def loadmodel(self, model_path, attention_mode="sdpa", use_float16=True):
+    def loadmodel(self, attention_mode="sdpa", use_float16=True):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         
         dtype = torch.float16 if use_float16 else torch.float32
-        
+        model_path = os.path.join(model_dir, "diffusers/TripoSG")
         if model_path.lower() == "pretrained":
             # Download model from HuggingFace
             from huggingface_hub import snapshot_download
@@ -81,7 +81,8 @@ class TripoSGModelLoader:
                 raise ValueError(f"Model path {model_path} does not exist")
         
         pipe = TripoSGPipeline.from_pretrained(model_path).to(device, dtype)
-        
+        pipe.to(offload_device)
+        mm.soft_empty_cache()
         return (pipe, pipe.vae)
 
 class TripoSGImageToMesh:
@@ -105,8 +106,8 @@ class TripoSGImageToMesh:
 
     def process(self, triposg_model, image, guidance_scale, steps, seed):
         device = mm.get_torch_device()
-        pipe = triposg_model
-        
+        offload_device = mm.unet_offload_device()
+        pipe = triposg_model.to(device)
         # Convert ComfyUI image to PIL
         if image.shape[0] > 1:
             log.info("Multiple images detected, using only the first one")
@@ -168,7 +169,9 @@ class TripoSGImageToMesh:
             if callback is not None:
                 callback_kwargs = {"latents": latents}
                 callback(pipe, i, t, callback_kwargs)
-                
+        pipe.to(offload_device)
+        del pipe
+        mm.soft_empty_cache()
         return (latents,)
 
 class TripoSGMeshInfo:
@@ -256,10 +259,11 @@ class TripoSGVAEDecoder:
 
     def process(self, triposg_vae, latents, use_flashvdm, bound_value, octree_resolution, extra_depth_level, chunk_size, mc_algo="mc"):
         device = mm.get_torch_device()
-        
+        offload_device = mm.unet_offload_device()
+        pipe_vae = triposg_vae.to(device)
         # Ensure latents are properly formatted
         if latents is not None:
-            latents = latents.to(device=device, dtype=triposg_vae.dtype)
+            latents = latents.to(device=device, dtype=pipe_vae.dtype)
         else:
             log.error("No latents provided to VAE decoder")
             return (Trimesh.Trimesh(),)
@@ -312,8 +316,8 @@ class TripoSGVAEDecoder:
             )
             
             # Process with FlashVDM approach
-            dilate = nn.Conv3d(1, 1, 3, padding=1, bias=False, device=device, dtype=triposg_vae.dtype)
-            dilate.weight = torch.nn.Parameter(torch.ones(dilate.weight.shape, dtype=triposg_vae.dtype, device=device))
+            dilate = nn.Conv3d(1, 1, 3, padding=1, bias=False, device=device, dtype=pipe_vae.dtype)
+            dilate.weight = torch.nn.Parameter(torch.ones(dilate.weight.shape, dtype=pipe_vae.dtype, device=device))
             
             grid_size = np.array(grid_size)
             
@@ -321,7 +325,7 @@ class TripoSGVAEDecoder:
             xyz_samples, mini_grid_size = process_grid_points(
                 xyz_samples=xyz_samples, 
                 device=device, 
-                dtype=triposg_vae.dtype, 
+                dtype=pipe_vae.dtype, 
                 batch_size=latents.shape[0], 
                 mini_grid_num=mini_grid_num
             )
@@ -342,7 +346,7 @@ class TripoSGVAEDecoder:
                 batch_latents = torch.repeat_interleave(latents, batch, dim=0)
                 
                 # Decode queries
-                logits = triposg_vae.decode(batch_latents, sampled_points=queries).sample
+                logits = pipe_vae.decode(batch_latents, sampled_points=queries).sample
                 batch_logits.append(logits)
                 pbar.update(1)
                 
@@ -360,8 +364,8 @@ class TripoSGVAEDecoder:
             for octree_depth_now in resolutions[1:]:
                 grid_size = np.array([octree_depth_now + 1] * 3)
                 resolution = bbox_size / octree_depth_now
-                next_index = torch.zeros(tuple(grid_size), dtype=triposg_vae.dtype, device=device)
-                next_logits = torch.full(next_index.shape, -10000., dtype=triposg_vae.dtype, device=device)
+                next_index = torch.zeros(tuple(grid_size), dtype=pipe_vae.dtype, device=device)
+                next_logits = torch.full(next_index.shape, -10000., dtype=pipe_vae.dtype, device=device)
                 
                 # Find near-surface points
                 curr_points = extract_near_surface_points(grid_logits.squeeze(0), mc_level)
@@ -375,7 +379,7 @@ class TripoSGVAEDecoder:
                     
                 # Dilate points if needed
                 for i in range(expand_num):
-                    curr_points = dilate(curr_points.unsqueeze(0).to(triposg_vae.dtype)).squeeze(0)
+                    curr_points = dilate(curr_points.unsqueeze(0).to(pipe_vae.dtype)).squeeze(0)
                 
                 # Get indices of points to evaluate
                 (cidx_x, cidx_y, cidx_z) = torch.where(curr_points > 0)
@@ -414,7 +418,7 @@ class TripoSGVAEDecoder:
                         # Process current batch
                         processor.topk = input_grid
                         queries = next_points[:, start_num:start_num + sum_num]
-                        logits_grid = triposg_vae.decode(latents, sampled_points=queries).sample
+                        logits_grid = pipe_vae.decode(latents, sampled_points=queries).sample
                         start_num = start_num + sum_num
                         logits_grid_list.append(logits_grid)
                         
@@ -426,7 +430,7 @@ class TripoSGVAEDecoder:
                 if sum_num > 0:
                     processor.topk = input_grid
                     queries = next_points[:, start_num:start_num + sum_num]
-                    logits_grid = triposg_vae.decode(latents, sampled_points=queries).sample
+                    logits_grid = pipe_vae.decode(latents, sampled_points=queries).sample
                     logits_grid_list.append(logits_grid)
                     
                 # Combine results
@@ -460,7 +464,9 @@ class TripoSGVAEDecoder:
                     
                     # Create trimesh
                     mesh = Trimesh.Trimesh(verts, faces)
-                    
+                    pipe_vae.to(offload_device)
+                    del pipe_vae
+                    mm.soft_empty_cache()
                     return (mesh,)
                 except Exception as e:
                     log.error(f"Error during mesh extraction: {str(e)}")
@@ -502,7 +508,9 @@ class TripoSGVAEDecoder:
                     
                     # Create trimesh
                     mesh = Trimesh.Trimesh(vertices, faces)
-                    
+                    pipe_vae.to(offload_device)
+                    del pipe_vae
+                    mm.soft_empty_cache()
                     return (mesh,)
                 except Exception as e:
                     log.error(f"Error during DMC mesh extraction: {str(e)}")
@@ -530,7 +538,7 @@ class TripoSGVAEDecoder:
                 
                 for i in range(0, num_points, chunk_size):
                     chunk = x[:, i:i+chunk_size, :]
-                    chunk_result = triposg_vae.decode(latents, sampled_points=chunk).sample
+                    chunk_result = pipe_vae.decode(latents, sampled_points=chunk).sample
                     chunks.append(chunk_result)
                     pbar.update(1)
                     
@@ -558,7 +566,9 @@ class TripoSGVAEDecoder:
                     
                 # Create trimesh from extracted geometry
                 mesh = Trimesh.Trimesh(output[0][0].astype(np.float32), np.ascontiguousarray(output[0][1]))
-                
+                pipe_vae.to(offload_device)
+                del pipe_vae
+                mm.soft_empty_cache()
                 return (mesh,)
             except Exception as e:
                 log.error(f"Error during mesh extraction: {str(e)}")
